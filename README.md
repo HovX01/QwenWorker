@@ -90,7 +90,29 @@ Do not put RunPod or Hugging Face tokens in source or build arguments.
 Public model downloads need no Hugging Face token. If your account requires authentication, add `HF_TOKEN` as a RunPod endpoint secret.
 
 RunPod limits the Docker build step to 30 minutes. If CUDA compilation exceeds that limit,
-use the remote Linux/CI build option below, then import its image. Neither route needs a local build.
+use the included GitHub Actions build below. Neither route needs a local build.
+
+## Build on GitHub Actions after a RunPod timeout
+
+The [Build worker image workflow](https://github.com/HovX01/QwenWorker/actions/workflows/build-image.yml)
+runs on relevant pushes to `main`, or manually using **Run workflow**. It runs the worker checks,
+builds on a GitHub-hosted Linux runner with a 180-minute limit, and publishes
+`ghcr.io/hovx01/qwenworker:latest` plus a tag containing the full commit SHA.
+No extra repository secret or registry account is needed; publishing uses `GITHUB_TOKEN`.
+Model weights are downloaded at worker startup, not included in the image.
+
+1. Open **Actions > Build worker image** and wait for a successful run.
+2. Open the [container package](https://github.com/users/HovX01/packages/container/package/qwenworker).
+   New packages default to private. Once published, open **Package settings > Change visibility > Public**
+   so RunPod can pull without registry credentials. Public container images are accessible to anyone.
+3. In RunPod, choose **New Endpoint > Import from Docker Registry** and enter
+   `ghcr.io/hovx01/qwenworker:latest`. To pin a build, replace `latest` with its full commit SHA.
+4. Choose **Queue** and the same GPU/worker settings above. Leave the start command unchanged.
+   Without a network volume, use **30 GB container disk** for the weights and temporary files.
+   The model cache is then temporary, and fresh workers can need another download.
+5. Deploy and submit the test request below. RunPod pulls the built image instead of compiling CUDA.
+
+After later builds, update the endpoint image to the new commit SHA to select that exact image.
 
 ## First test in RunPod console
 
