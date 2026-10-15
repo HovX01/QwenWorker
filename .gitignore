@@ -4,3 +4,4 @@ __pycache__/
 .venv/
 *.png
 result.json
+edit_input.json

@@ -1,4 +1,5 @@
 import base64
+import io
 import json
 import sys
 import threading
@@ -7,10 +8,18 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import Mock, patch
 
+from PIL import Image
+
 import worker
 
 
 PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jL1kAAAAASUVORK5CYII="
+
+
+def encoded_image(size=(32, 32), image_format="PNG"):
+    buffer = io.BytesIO()
+    Image.new("RGB", size, "red").save(buffer, format=image_format)
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
 class Backend(BaseHTTPRequestHandler):
@@ -86,6 +95,35 @@ class WorkerTests(unittest.TestCase):
                 self.assertIn("error", worker.handler(job))
                 self.assertIsNone(Backend.payload)
 
+    def test_image_edit_forwards_reference_and_keeps_turbo_settings(self):
+        for image_format, size in (("PNG", (1024, 1024)), ("JPEG", (1536, 672))):
+            with self.subTest(image_format=image_format):
+                reference = encoded_image(size, image_format)
+                data = {"prompt": "Change the cup to blue", "image_base64": reference,
+                        "width": 768, "height": 768, "seed": 42}
+                result = worker.handler({"input": data})
+                self.assertEqual(result["image_base64"], PNG)
+                self.assertEqual(Backend.payload, {
+                    "prompt": data["prompt"], "extra_images": [reference],
+                    "width": 768, "height": 768, "seed": 42,
+                    "steps": 8, "cfg_scale": 1.0, "sampler_name": "Euler", "batch_size": 1,
+                })
+
+    def test_invalid_images_never_reach_backend(self):
+        jpeg = base64.b64decode(encoded_image(image_format="JPEG"))
+        invalid = [None, "", 1, [], "%%", "Zm9v", PNG[:40],
+                   "data:image/png;base64," + PNG, encoded_image(image_format="GIF"),
+                   base64.b64encode(jpeg[:-20]).decode("ascii"),
+                   encoded_image((1536, 1024)), encoded_image((1537, 1)),
+                   "A" * (4 * ((worker.MAX_IMAGE_BYTES + 2) // 3) + 4),
+                   base64.b64encode(b"x" * (worker.MAX_IMAGE_BYTES + 1)).decode("ascii")]
+        for index, reference in enumerate(invalid):
+            with self.subTest(case=index):
+                result = worker.handler({"input": {"prompt": "Make it blue", "image_base64": reference}})
+                self.assertIn("error", result)
+                self.assertNotIn("refresh_worker", result)
+                self.assertIsNone(Backend.payload)
+
     def test_defaults_and_seed_boundaries(self):
         for data in [{"prompt": "cat"}, {"prompt": "cat", "seed": 0},
                      {"prompt": "cat", "seed": 2**32 - 1, "width": 1536, "height": 672}]:
@@ -119,7 +157,9 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(len(worker.TURBO_SIGMAS.split(",")), 9)
         self.assertEqual(command[command.index("--steps") + 1], "8")
         self.assertEqual(command[command.index("--cfg-scale") + 1], "1.0")
-        self.assertEqual(download.call_count, 3)
+        self.assertEqual(download.call_count, 4)
+        self.assertEqual(command[command.index("--llm_vision") + 1],
+                         "/cache/mmproj-Qwen-Image-2.1-Turbo-Uncensored-F16.gguf")
         self.assertEqual({call.kwargs["revision"] for call in download.call_args_list},
                          {model[2] for model in worker.MODELS.values()})
 

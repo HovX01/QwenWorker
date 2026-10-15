@@ -6,21 +6,22 @@ Uses a persistent `stable-diffusion.cpp` server, so weights load once per worker
 No ComfyUI, PyTorch, public inference port, or separate web service.
 
 The requested repository contains the **text encoder**, not the complete image model.
-Worker downloads these three pinned artifacts at startup:
+Worker downloads these four pinned artifacts at startup:
 
 | Component | Repository | File | Download size |
 | --- | --- | --- | --- |
 | Denoiser | `AtomicChat/Qwen-Image-2.1-Turbo-GGUF` | `Qwen-Image-2.1-Turbo-AD-Q4_K.gguf` | 4.20 GB |
 | Text encoder | `AtomicChat/Qwen-Image-2.1-Turbo-Uncensored-GGUF` | `Qwen-Image-2.1-Turbo-Uncensored-Q8_0.gguf` | 8.71 GB |
 | VAE | `Comfy-Org/Qwen-Image-2.1` | `vae/qwen_image_2.1_vae_bf16.safetensors` | 0.68 GB |
+| Vision projector | `AtomicChat/Qwen-Image-2.1-Turbo-Uncensored-GGUF` | `mmproj-Qwen-Image-2.1-Turbo-Uncensored-F16.gguf` | 1.16 GB |
 
 Turbo sampling is fixed to the publisher's 8 steps, CFG 1, Euler, and exact sigma schedule.
-Text-to-image only. Vision projector, image editing, and LoRAs are omitted.
+Supports text-to-image and instruction-based editing with one reference image. LoRAs are omitted.
 
 ## Choose GPU and endpoint settings
 
 For occasional personal use, start with **one RTX 3090 24 GB**, keeping the current
-AD-Q4_K denoiser and Q8_0 encoder. The 13.6 GB weight files leave more headroom on 24 GB
+AD-Q4_K denoiser and Q8_0 encoder. The 14.8 GB weight files leave more headroom on 24 GB
 than on 16 GB, but file size is not peak VRAM. This configuration still needs a real GPU test.
 The engine's automatic memory fitting is enabled by default.
 
@@ -62,7 +63,7 @@ The current image does not target A100, H100, RTX 5090, or other Blackwell GPUs.
 | Exposed ports | None |
 
 Create the network volume in a data center offering the selected GPUs. Attaching one volume
-restricts workers to that data center. The model cache uses about 13.6 GB of the volume.
+restricts workers to that data center. The model cache uses about 14.8 GB of the volume.
 Keep only this pinned model set in the 20 GB volume; extra quantizations need more storage.
 At RunPod's documented standard rate of $0.07/GB/month, 20 GB costs about $1.40/month
 even when workers scale to zero. The persistent cache avoids repeated downloads on fresh workers.
@@ -83,7 +84,7 @@ No local Docker build, CUDA image, model download, or Docker registry account is
 4. Apply the endpoint settings in the table above. Select the network volume in **Advanced > Network Volumes**. For an existing endpoint, use **Manage > Edit Endpoint** first. Leave the image's start command unchanged.
 5. Click **Deploy Endpoint**. RunPod builds the image before starting workers; check the **Builds** tab and then worker logs. Each worker handles one image at a time. Active workers 0 allows scale-to-zero; idle workers still incur charges until they stop.
 
-Space budget: project source uses only tens of KB locally. RunPod needs about **13.6 GB for weights**,
+Space budget: project source uses only tens of KB locally. RunPod needs about **14.8 GB for weights**,
 plus the CUDA runtime image and temporary build space. Do not build this image on a nearly full Mac.
 Do not put RunPod or Hugging Face tokens in source or build arguments.
 
@@ -129,7 +130,7 @@ Open the deployed endpoint's **Requests** tab. Paste the contents of `test_input
 }
 ```
 
-The first job downloads weights and loads the engine. Watch **Workers** logs for the three
+The first job downloads weights and loads the engine. Watch **Workers** logs for the four
 `Preparing ...` messages, downloads, and `listening on: http://127.0.0.1:1234`.
 Successful job status is `COMPLETED`, with PNG base64 at `output.image_base64`.
 Run the same job again before the idle timeout to check warm-worker reuse.
@@ -175,21 +176,65 @@ RunPod's GitHub integration does not redeploy on every commit alone.
 
 Input fields: required `prompt` (1–4000 characters), optional `width` and `height`
 (default 1024, multiples of 32 from 256 to 1536, at most 1,048,576 pixels total),
-and optional `seed` (0–4294967295; random if omitted).
+optional `seed` (0–4294967295; random if omitted), and optional `image_base64` for editing.
 Output contains `image_base64`, `mime_type`, `width`, `height`, and `seed`.
 Validation errors fail the job. Backend failures also request worker recycling.
 RunPod's API key protects access; the model server listens only on container loopback.
 
-## Checks
+## Edit an image
 
-No dependencies, models, or GPU needed for the local contract checks:
+Use the image built from this revision; an older deployed image rejects `image_base64`.
+After the GitHub build succeeds, update the RunPod endpoint to the new commit SHA image tag
+and deploy it. Queue type, GPU settings, default start command, and 30 GB container disk
+without a network volume stay the same. Startup downloads the additional 1.16 GB projector.
+
+Supply one PNG or JPEG as **raw base64** in `input.image_base64`, together with an edit instruction
+in `input.prompt`. Image URLs and data URL prefixes are not accepted. The decoded file must be
+at most 4 MiB, 1536 pixels per side, and 1,048,576 pixels total. Output dimensions follow the
+same limits as text-to-image; choose dimensions matching the reference image's aspect ratio.
+Requests without `image_base64` keep generating images from text.
+
+Create a request from a local `input.png` (change the filename for a JPEG):
 
 ```sh
+python3 - <<'PY'
+import base64, json
+from pathlib import Path
+
+job = {"input": {
+    "prompt": "Change the cup to blue. Keep the background unchanged.",
+    "image_base64": base64.b64encode(Path("input.png").read_bytes()).decode("ascii"),
+    "width": 768,
+    "height": 768,
+    "seed": 42,
+}}
+Path("edit_input.json").write_text(json.dumps(job))
+PY
+
+curl --fail-with-body "https://api.runpod.ai/v2/${RUNPOD_ENDPOINT_ID}/run" \
+  -H "Authorization: Bearer ${RUNPOD_API_KEY}" \
+  -H 'Content-Type: application/json' \
+  --data-binary @edit_input.json
+```
+
+Alternatively, paste `edit_input.json` into the endpoint's **Requests** tab and click **Run**.
+Poll the returned job ID and save `output.image_base64` using the commands above.
+The worker sends the image as a Qwen reference image through the backend's `extra_images` field;
+this is instruction-based editing, with the same fixed Turbo sampler and sigma schedule.
+Editing quality, latency, and peak VRAM require a real GPU test with your own reference image.
+
+## Checks
+
+Install Python requirements before the local contract checks. No models or GPU are needed:
+
+```sh
+python3 -m pip install -r requirements.txt
 python3 -m unittest -v test_worker.py
 ```
 
 These checks use a fake local inference server. They cover input limits, blocked backend
-configuration injection, request/response handling, worker recycling, and startup sampling arguments.
+configuration injection, reference-image forwarding and validation, request/response handling,
+worker recycling, and startup sampling arguments including the vision projector.
 They do not prove CUDA compilation or image generation.
 
 After deployment, submit `test_input.json`, verify the saved image, then submit a second job

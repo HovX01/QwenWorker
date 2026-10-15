@@ -1,3 +1,5 @@
+import base64
+import io
 import json
 import os
 import secrets
@@ -6,8 +8,12 @@ import time
 import urllib.error
 import urllib.request
 
+from PIL import Image
+
 
 SERVER_URL = "http://127.0.0.1:1234"
+MAX_IMAGE_BYTES = 4 * 1024 * 1024
+MAX_IMAGE_PIXELS = 1024 * 1024
 TURBO_SIGMAS = "1.0,0.978453,0.95418,0.926626,0.89508,0.845148,0.704534,0.414568,0.0"
 MODELS = {
     "--diffusion-model": (
@@ -25,6 +31,11 @@ MODELS = {
         "vae/qwen_image_2.1_vae_bf16.safetensors",
         "a8342359c61979b06a8dafb1a47991fe1f30e994",
     ),
+    "--llm_vision": (
+        "AtomicChat/Qwen-Image-2.1-Turbo-Uncensored-GGUF",
+        "mmproj-Qwen-Image-2.1-Turbo-Uncensored-F16.gguf",
+        "df96693dbdfb8738c0bf1bbd0337d149808db948",
+    ),
 }
 
 
@@ -32,8 +43,8 @@ def handler(job):
     data = job.get("input") if isinstance(job, dict) else None
     if not isinstance(data, dict):
         return {"error": "input must be an object"}
-    if set(data) - {"prompt", "width", "height", "seed"}:
-        return {"error": "Allowed input fields: prompt, width, height, seed"}
+    if set(data) - {"prompt", "width", "height", "seed", "image_base64"}:
+        return {"error": "Allowed input fields: prompt, width, height, seed, image_base64"}
 
     prompt = data.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 4000:
@@ -47,7 +58,7 @@ def handler(job):
         if type(value) is not int or not 256 <= value <= 1536 or value % 32:
             return {"error": f"{name} must be an integer multiple of 32 from 256 to 1536"}
     # shortcut: inline results stay at 1 megapixel; add object storage before raising this limit.
-    if width * height > 1024 * 1024:
+    if width * height > MAX_IMAGE_PIXELS:
         return {"error": "width * height must not exceed 1048576 pixels"}
 
     seed = data.get("seed", secrets.randbelow(2**32))
@@ -64,6 +75,24 @@ def handler(job):
         "sampler_name": "Euler",
         "batch_size": 1,
     }
+    if "image_base64" in data:
+        reference = data["image_base64"]
+        if not isinstance(reference, str) or not reference:
+            return {"error": "image_base64 must be a nonempty raw base64 string"}
+        if len(reference) > 4 * ((MAX_IMAGE_BYTES + 2) // 3):
+            return {"error": "Input image must not exceed 4 MiB"}
+        try:
+            decoded = base64.b64decode(reference, validate=True)
+            if len(decoded) > MAX_IMAGE_BYTES:
+                return {"error": "Input image must not exceed 4 MiB"}
+            with Image.open(io.BytesIO(decoded), formats=("PNG", "JPEG")) as source:
+                if max(source.size) > 1536 or source.width * source.height > MAX_IMAGE_PIXELS:
+                    return {"error": "Input image must not exceed 1536 pixels per side or 1048576 pixels total"}
+                source.load()
+        except (ValueError, OSError, SyntaxError, Image.DecompressionBombError):
+            return {"error": "image_base64 must contain a valid PNG or JPEG"}
+        payload["extra_images"] = [reference]
+
     request = urllib.request.Request(
         SERVER_URL + "/sdapi/v1/txt2img",
         data=json.dumps(payload).encode(),
